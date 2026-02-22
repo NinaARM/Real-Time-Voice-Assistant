@@ -20,6 +20,7 @@ object Constants {
     const val EOS = "<eos>"
     const val NEXT_MESSAGE = "</NextMessage>"
 
+
     const val MARKDOWN_CODE = "```"
 
     const val STT_MODEL_NAME = "model.bin"
@@ -45,4 +46,7 @@ object Constants {
     const val AUD_REC_SAVE_FAILED = "Failed to save audio recording."
     const val SME_ENABLED_THREADS_CONFIG_WARNING = "SME features available on device. " +
             "Recommended threads may differ."
+
+    const val DOWNLOAD_MANAGER_DOUBLE_CHECK_DELAY = 500L
+    const val HUGGING_FACE_HOST = "https://huggingface.co/"
 }
