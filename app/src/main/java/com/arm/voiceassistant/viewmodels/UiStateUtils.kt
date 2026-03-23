@@ -6,6 +6,7 @@
 
 package com.arm.voiceassistant.viewmodels
 
+import com.arm.voiceassistant.huggingface.HuggingFaceModel
 import com.arm.voiceassistant.utils.Constants.ContentStates
 import com.arm.voiceassistant.utils.Constants.INITIAL_METRICS_VALUE
 
@@ -59,10 +60,40 @@ data class DownloadUiState(
     val done: Int = 0,
     val total: Int = 0,
     val fileProgress: Int = -1,              // 0..100 or -1 unknown
+    val currentFile: String? = null,
+    val currentModelKey: String? = null,
     val canStart: Boolean = true,
     val canCancel: Boolean = false,
     val isRunning: Boolean = false,
     val finishedOk: Boolean = false
+)
+
+/**
+ * HuggingFace model list UI state.
+ *
+ * @property isLoading Whether models are being fetched.
+ * @property models List of models from HuggingFace.
+ * @property error Optional error message for failures.
+ */
+data class ModelListUiState(
+    val isLoading: Boolean = false,
+    val models: List<HuggingFaceModel> = emptyList(),
+    val error: String? = null
+)
+
+/**
+ * Model details UI state.
+ *
+ * @property isLoading Whether model details are being fetched.
+ * @property selectedModel Currently selected model for details.
+ * @property files List of files in the model repo.
+ * @property error Optional error message for failures.
+ */
+data class ModelDetailsUiState(
+    val isLoading: Boolean = false,
+    val selectedModel: HuggingFaceModel? = null,
+    val files: List<String> = emptyList(),
+    val error: String? = null
 )
 
 /**

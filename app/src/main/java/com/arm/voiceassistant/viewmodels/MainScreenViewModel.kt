@@ -7,10 +7,10 @@
 package com.arm.voiceassistant.viewmodels
 
 import android.app.Application
-import android.app.DownloadManager
 import android.content.Context
 import android.net.Uri
 import android.os.Environment
+import android.provider.OpenableColumns
 import android.util.Log
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.snapshots.SnapshotStateList
@@ -23,12 +23,16 @@ import com.arm.voiceassistant.data.benchmark.BenchmarkHistoryEntry
 import com.arm.voiceassistant.data.benchmark.BenchmarkHistoryRepository
 import com.arm.voiceassistant.data.benchmark.BenchmarkOverheadSummary
 import com.arm.voiceassistant.data.benchmark.isValid
-import com.arm.voiceassistant.huggingface.HuggingFaceDownloadInfo
-import com.arm.voiceassistant.huggingface.HuggingFaceRemoteDataSourceImpl
+import com.arm.voiceassistant.huggingface.DownloadProgressEvent
+import com.arm.voiceassistant.huggingface.HuggingFaceModel
+import com.arm.voiceassistant.huggingface.HuggingFaceApiService
+import com.arm.voiceassistant.huggingface.LoggingProgressListener
+import com.arm.voiceassistant.huggingface.ModelDownloadSpec
 import com.arm.voiceassistant.utils.ChatMessage
 import com.arm.voiceassistant.utils.ChatMetricsUpdater
 import com.arm.voiceassistant.utils.Constants.ContentStates
 import com.arm.voiceassistant.utils.Constants.EOS
+import com.arm.voiceassistant.utils.Constants.FAILED_TO_LOAD_MODELS
 import com.arm.voiceassistant.utils.Constants.INITIAL_METRICS_VALUE
 import com.arm.voiceassistant.utils.Constants.LLM_CONTEXT_CAPACITY_ERROR
 import com.arm.voiceassistant.utils.Constants.LLM_DECODE_ERROR
@@ -52,7 +56,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -64,6 +67,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okhttp3.Call
+import okhttp3.OkHttpClient
 import java.io.File
 import java.io.FileOutputStream
 
@@ -71,6 +76,7 @@ import java.io.FileOutputStream
  * The default filename used for storing the recorded audio file.
  */
 private const val FILE_NAME = "recording.wav"
+
 
 /**
  * Main ViewModel responsible for holding and managing UI related data
@@ -85,8 +91,14 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
     var uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
     private val _downloadUiState = MutableStateFlow(DownloadUiState())
     val downloadUiState: StateFlow<DownloadUiState> = _downloadUiState.asStateFlow()
-    private var currentDownloadId: Long? = null
-    private var downloadMonitorJob: Job? = null
+    private val _modelListUiState = MutableStateFlow(ModelListUiState())
+    val modelListUiState: StateFlow<ModelListUiState> = _modelListUiState.asStateFlow()
+    private val _modelDetailsUiState = MutableStateFlow(ModelDetailsUiState())
+    val modelDetailsUiState: StateFlow<ModelDetailsUiState> = _modelDetailsUiState.asStateFlow()
+    private var downloadJob: Job? = null
+    private var downloadClient: OkHttpClient? = null
+    private var downloadCall: Call? = null
+    @Volatile private var downloadCanceled = false
     val messages: SnapshotStateList<ChatMessage> = mutableStateListOf()
 
     private val filePath: String =
@@ -119,10 +131,10 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
 
 
     private val stringStatusFlow = MutableSharedFlow<String>()
-    val errorFlow: SharedFlow<String> = stringStatusFlow.asSharedFlow()
+    private val errorFlow: SharedFlow<String> = stringStatusFlow.asSharedFlow()
 
     private val applicationContext: Context = application.applicationContext
-    private val huggingFaceRemoteDataSource = HuggingFaceRemoteDataSourceImpl()
+    private val huggingFaceApiService = HuggingFaceApiService()
 
     /**
      * Initializes the [Pipeline] and related LLM helpers.
@@ -260,8 +272,23 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
         }
 
         val chosen = ggufFiles.first()
+        logModelFileAccess(chosen)
         Log.i(VOICE_ASSISTANT_TAG, "Using GGUF model: ${chosen.absolutePath}")
         return chosen.absolutePath
+    }
+
+    private fun logModelFileAccess(file: File) {
+        val status = "exists=${file.exists()} isFile=${file.isFile} canRead=${file.canRead()} size=${file.length()}"
+        Log.d(VOICE_ASSISTANT_TAG, "Model file access check: ${file.absolutePath} ($status)")
+        runCatching {
+            file.inputStream().use { input ->
+                val buffer = ByteArray(16)
+                val read = input.read(buffer)
+                Log.d(VOICE_ASSISTANT_TAG, "Model file read probe: bytesRead=$read")
+            }
+        }.onFailure { e ->
+            Log.e(VOICE_ASSISTANT_TAG, "Model file read probe failed: ${file.absolutePath}", e)
+        }
     }
 
 
@@ -325,12 +352,12 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
         }
 
         val summary = BenchmarkOverheadSummary(
-            javaEncodeTotalMs = llm.getLastBenchmarkJavaEncodeTotalMs(),
-            coreCppEncodeTotalMs = llm.getLastBenchmarkCoreCppEncodeTotalMs(),
-            encodeOverheadMs = llm.getLastBenchmarkEncodeOverheadMs(),
-            javaDecodeTotalMs = llm.getLastBenchmarkJavaDecodeLoopTotalMs(),
-            coreCppDecodeTotalMs = llm.getLastBenchmarkCoreCppDecodeTotalMs(),
-            decodeOverheadMs = llm.getLastBenchmarkDecodeOverheadMs()
+            javaEncodeTotalMs = llm.lastBenchmarkJavaEncodeTotalMs,
+            coreCppEncodeTotalMs = llm.lastBenchmarkCoreCppEncodeTotalMs,
+            encodeOverheadMs = llm.lastBenchmarkEncodeOverheadMs,
+            javaDecodeTotalMs = llm.lastBenchmarkJavaDecodeLoopTotalMs,
+            coreCppDecodeTotalMs = llm.lastBenchmarkCoreCppDecodeTotalMs,
+            decodeOverheadMs = llm.lastBenchmarkDecodeOverheadMs
         )
 
         return if (!summary.isValid) {
@@ -961,231 +988,290 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
         _uiState.update { it.copy(ttsWarningMessage = null) }
     }
 
-    fun startModelDownload() {
+    fun downloadModelFile(model: HuggingFaceModel, filename: String) {
         if (_downloadUiState.value.isRunning) {
             return
         }
-        _downloadUiState.update {
+        downloadCanceled = false
+        val modelKey = "${model.id}/${model.modelId}"
+        updateDownloadUi {
             it.copy(
                 canStart = false,
                 canCancel = true,
                 isRunning = true,
-                finishedOk = false
+                finishedOk = false,
+                currentFile = filename,
+                currentModelKey = modelKey,
+                fileProgress = 0,
+                done = 0,
+                total = 0
             )
         }
-        downloadModels()
+        val modelInfo = model.copy(filename = filename)
+        Log.i(VOICE_ASSISTANT_TAG, "downloading... ${modelInfo.id} / ${modelInfo.modelId} / ${modelInfo.filename}")
+        val client = OkHttpClient()
+        downloadClient = client
+        downloadJob = viewModelScope.launch {
+            val logger = LoggingProgressListener { event ->
+                if (downloadCanceled) return@LoggingProgressListener
+                when (event) {
+                    is DownloadProgressEvent.Start -> {
+                        updateDownloadUi {
+                            it.copy(
+                                canStart = false,
+                                canCancel = true,
+                                isRunning = true,
+                                finishedOk = false,
+                                currentFile = event.fileName,
+                                currentModelKey = modelKey
+                            )
+                        }
+                    }
+                    is DownloadProgressEvent.Progress -> {
+                        val totalSafe =
+                            event.totalBytes?.coerceAtMost(Int.MAX_VALUE.toLong())?.toInt() ?: 0
+                        val doneSafe = event.downloadedBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                        val progress = if (event.totalBytes != null && event.totalBytes > 0L) {
+                            ((event.downloadedBytes * 100) / event.totalBytes).toInt().coerceIn(0, 100)
+                        } else {
+                            -1
+                        }
+                        updateDownloadUi {
+                            it.copy(
+                                canStart = false,
+                                canCancel = true,
+                                isRunning = true,
+                                finishedOk = false,
+                                done = doneSafe,
+                                total = totalSafe,
+                                fileProgress = progress,
+                                currentFile = filename,
+                                currentModelKey = modelKey
+                            )
+                        }
+                    }
+                    is DownloadProgressEvent.Complete -> {
+                        updateDownloadUi {
+                            it.copy(
+                                canStart = true,
+                                canCancel = false,
+                                isRunning = false,
+                                finishedOk = true,
+                                fileProgress = 100,
+                                currentFile = null,
+                                currentModelKey = null
+                            )
+                        }
+                    }
+                    is DownloadProgressEvent.Error -> {
+                        updateDownloadUi {
+                            it.copy(
+                                canStart = true,
+                                canCancel = false,
+                                isRunning = false,
+                                finishedOk = false,
+                                currentFile = null,
+                                currentModelKey = null
+                            )
+                        }
+                    }
+                }
+            }
+            logger.onStart(filename)
+            runCatching {
+                huggingFaceApiService.downloadModelFile(
+                    context = applicationContext,
+                    client = client,
+                    modelInfo = modelInfo,
+                    downloadPath = "$filePath/$llmFramework/${modelInfo.modelId}",
+                    spec = ModelDownloadSpec(
+                        url = modelInfo.uri.toString(),
+                        fileName = filename,
+                        sha256 = null
+                    ),
+                    listener = logger,
+                    onCallCreated = { call ->
+                        downloadCall = call
+                    }
+                )
+            }.onSuccess {
+                if (!downloadCanceled) {
+                    logger.onComplete(filename)
+                }
+            }.onFailure { e ->
+                if (!downloadCanceled) {
+                    logger.onError(filename, e)
+                }
+            }.also {
+                downloadClient = null
+                downloadJob = null
+                downloadCall = null
+            }
+        }
+    }
+
+    /**
+     * Load models from HuggingFace
+     *
+     * @param tag:            pipeline tag to use, default tag image-text-to-text
+     * @param maxParameters:  max number of parameters of models to show, default max of 4GB
+     */
+    fun loadHuggingFaceModels(
+        tag: String = "text-generation",
+        maxParameters: Int = 2
+    ) {
+        if (_modelListUiState.value.isLoading) {
+            return
+        }
+        _modelListUiState.update { it.copy(isLoading = true, error = null) }
+        viewModelScope.launch {
+            val result = huggingFaceApiService.listModels(
+                context = applicationContext,
+                tag = tag,
+                maxParameters = maxParameters
+            )
+            _modelListUiState.update { state ->
+                if (result.isSuccess) {
+                    state.copy(
+                        isLoading = false,
+                        models = result.getOrDefault(emptyList()),
+                        error = null
+                    )
+                } else {
+                    state.copy(
+                        isLoading = false,
+                        error = result.exceptionOrNull()?.message ?: FAILED_TO_LOAD_MODELS
+                    )
+                }
+            }
+        }
+    }
+
+    fun selectModelForDetails(model: HuggingFaceModel) {
+        _modelDetailsUiState.update {
+            it.copy(
+                isLoading = true,
+                selectedModel = model,
+                files = emptyList(),
+                error = null
+            )
+        }
+        viewModelScope.launch {
+            val result = huggingFaceApiService.listModelFiles(
+                context = applicationContext,
+                modelInfo = model
+            )
+            _modelDetailsUiState.update { state ->
+                if (result.isSuccess) {
+                    state.copy(
+                        isLoading = false,
+                        files = result.getOrDefault(emptyList()),
+                        error = null
+                    )
+                } else {
+                    state.copy(
+                        isLoading = false,
+                        error = result.exceptionOrNull()?.message ?: FAILED_TO_LOAD_MODELS
+                    )
+                }
+            }
+        }
+    }
+
+    fun clearSelectedModel() {
+        _modelDetailsUiState.update {
+            it.copy(
+                isLoading = false,
+                selectedModel = null,
+                files = emptyList(),
+                error = null
+            )
+        }
     }
 
     fun cancelModelDownload() {
-        val downloadId = currentDownloadId ?: run {
-            updateDownloadUi(
-                canStart = true,
-                canCancel = false,
-                isRunning = false,
-                finishedOk = false
-            )
-            stopDownloadMonitor()
-            return
+        downloadCanceled = true
+        downloadJob?.cancel()
+        downloadJob = null
+        val call = downloadCall
+        downloadCall = null
+        val client = downloadClient
+        downloadClient = null
+        if (call != null) {
+            call.cancel()
         }
-        val downloadManager =
-            applicationContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        val removed = downloadManager.remove(downloadId)
-        if (removed > 0) {
-            currentDownloadId = null
-            updateDownloadUi(
-                canStart = true,
-                canCancel = false,
-                isRunning = false,
-                finishedOk = false
-            )
-            stopDownloadMonitor()
+        if (client != null) {
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching {
+                    client.dispatcher.cancelAll()
+                    client.connectionPool.evictAll()
+                }.onFailure { error ->
+                    Log.w(VOICE_ASSISTANT_TAG, "Failed to cancel download client", error)
+                }
+            }
         }
-    }
-
-    private fun updateDownloadUi(
-        canStart: Boolean,
-        canCancel: Boolean,
-        isRunning: Boolean,
-        finishedOk: Boolean,
-        done: Int? = null,
-        total: Int? = null,
-        fileProgress: Int? = null
-    ) {
-        _downloadUiState.update {
+        updateDownloadUi {
             it.copy(
-                canStart = canStart,
-                canCancel = canCancel,
-                isRunning = isRunning,
-                finishedOk = finishedOk,
-                done = done ?: it.done,
-                total = total ?: it.total,
-                fileProgress = fileProgress ?: it.fileProgress
+                canStart = true,
+                canCancel = false,
+                isRunning = false,
+                finishedOk = false,
+                currentFile = null,
+                currentModelKey = null
             )
         }
     }
 
+    private fun updateDownloadUi(update: (DownloadUiState) -> DownloadUiState) {
+        _downloadUiState.update(update)
+    }
 
-    private fun downloadModels() {
-        val downloadInfo = HuggingFaceDownloadInfo(
-            id = "ggml-org",
-            modelId = "Qwen2.5-VL-3B-Instruct-GGUF",
-            filename = "Qwen2.5-VL-3B-Instruct-Q8_0.gguf",
-        )
-        Log.i(VOICE_ASSISTANT_TAG, "Download URI:  ${downloadInfo.uri}")
+    /**
+     * Imports a model file selected by the user into the app's LLM models folder.
+     * @param uri The [Uri] of the model selected by the user.
+     */
+    fun importModel(uri: Uri) {
+        Log.i(VOICE_ASSISTANT_TAG, "importing model: ${uri.path}")
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val inputStream = contentResolver.openInputStream(uri)
+                val filename = resolveDisplayName(uri)
+                val destDir = File(filePath, llmFramework)
+                val destDir2 = File(destDir, resolveDisplayNameWithoutExtension(uri))
+                if (!destDir2.mkdirs()) {
+                    Log.i(VOICE_ASSISTANT_TAG, "Failed to create destination directory: $destDir2")
+                }
 
-        viewModelScope.launch {
-            val result = huggingFaceRemoteDataSource.downloadModelFile(
-                context = applicationContext,
-                downloadInfo = downloadInfo,
-                downloadPath = "$filePath/$llmFramework/${downloadInfo.modelId}",
-            )
-            _downloadUiState.update {
-                if (result.isSuccess) {
-                    currentDownloadId = result.getOrNull()
-                    currentDownloadId?.let { startDownloadMonitor(it) }
-                    it.copy(
-                        isRunning = true,
-                        canStart = false,
-                        canCancel = true,
-                        fileProgress = -10
-                    )
-                } else {
-                    currentDownloadId = null
-                    it.copy(
-                        isRunning = false,
-                        canStart = true,
-                        canCancel = false,
-                        finishedOk = false
-                    )
+                val originalResFile = File(destDir2, filename)
+                try {
+                    val outputStream = FileOutputStream(originalResFile)
+                    inputStream?.copyTo(outputStream)
+                    Log.i(VOICE_ASSISTANT_TAG, "Imported model to directory: $destDir2")
+                } catch (e : Exception) {
+                    Log.e(VOICE_ASSISTANT_TAG, "Local model import failed: $e")
                 }
             }
         }
     }
 
-    private fun startDownloadMonitor(downloadId: Long) {
-        stopDownloadMonitor()
-        downloadMonitorJob = viewModelScope.launch(Dispatchers.IO) {
-            val downloadManager =
-                applicationContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+    private fun resolveDisplayName(uri: Uri): String? {
+        fun withLocalPrefix(name: String): String {
+            return if (name.startsWith("local_")) name else "local_$name"
+        }
 
-            while (isActive) {
-                if (currentDownloadId != downloadId) {
-                    break
-                }
-
-                val cursor = downloadManager.query(DownloadManager.Query().setFilterById(downloadId))
-                if (cursor == null || !cursor.moveToFirst()) {
-                    cursor?.close()
-                    if (currentDownloadId == downloadId) {
-                        currentDownloadId = null
-                        updateDownloadUi(
-                            canStart = true,
-                            canCancel = false,
-                            isRunning = false,
-                            finishedOk = false,
-                            fileProgress = -1
-                        )
-                    }
-                    break
-                }
-
-                val statusIndex = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
-                val status = if (statusIndex >= 0) cursor.getInt(statusIndex) else -1
-                val downloadedIndex =
-                    cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
-                val totalIndex = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
-                val downloaded = if (downloadedIndex >= 0) cursor.getLong(downloadedIndex) else -1L
-                val total = if (totalIndex >= 0) cursor.getLong(totalIndex) else -1L
-                cursor.close()
-
-                val progress = if (total > 0 && downloaded >= 0) {
-                    ((downloaded * 100L) / total).toInt().coerceIn(0, 100)
-                } else {
-                    -1
-                }
-                val doneSafe = if (downloaded > Int.MAX_VALUE) Int.MAX_VALUE else downloaded.toInt()
-                val totalSafe = if (total > Int.MAX_VALUE) Int.MAX_VALUE else total.toInt()
-
-                when (status) {
-                    DownloadManager.STATUS_SUCCESSFUL -> {
-                        currentDownloadId = null
-                        updateDownloadUi(
-                            canStart = false,
-                            canCancel = false,
-                            isRunning = false,
-                            finishedOk = true,
-                            done = doneSafe,
-                            total = totalSafe,
-                            fileProgress = 100
-                        )
-                        break
-                    }
-                    DownloadManager.STATUS_FAILED -> {
-                        currentDownloadId = null
-                        updateDownloadUi(
-                            canStart = true,
-                            canCancel = false,
-                            isRunning = false,
-                            finishedOk = false,
-                            done = doneSafe,
-                            total = totalSafe,
-                            fileProgress = progress
-                        )
-                        break
-                    }
-                    DownloadManager.STATUS_PAUSED -> {
-                        updateDownloadUi(
-                            canStart = false,
-                            canCancel = true,
-                            isRunning = true,
-                            finishedOk = false,
-                            done = doneSafe,
-                            total = totalSafe,
-                            fileProgress = progress
-                        )
-                    }
-                    DownloadManager.STATUS_PENDING -> {
-                        updateDownloadUi(
-                            canStart = false,
-                            canCancel = true,
-                            isRunning = true,
-                            finishedOk = false,
-                            done = doneSafe,
-                            total = totalSafe,
-                            fileProgress = progress
-                        )
-                    }
-                    DownloadManager.STATUS_RUNNING -> {
-                        updateDownloadUi(
-                            canStart = false,
-                            canCancel = true,
-                            isRunning = true,
-                            finishedOk = false,
-                            done = doneSafe,
-                            total = totalSafe,
-                            fileProgress = progress
-                        )
-                    }
-                    else -> {
-                        updateDownloadUi(
-                            canStart = false,
-                            canCancel = true,
-                            isRunning = true,
-                            finishedOk = false,
-                            done = doneSafe,
-                            total = totalSafe,
-                            fileProgress = progress
-                        )
-                    }
-                }
-
-                delay(750L)
+        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (nameIndex != -1 && cursor.moveToFirst()) {
+               return withLocalPrefix(cursor.getString(nameIndex))
             }
         }
+        return uri.lastPathSegment?.let(::withLocalPrefix)
     }
 
-    private fun stopDownloadMonitor() {
-        downloadMonitorJob?.cancel()
-        downloadMonitorJob = null
+    private fun resolveDisplayNameWithoutExtension(uri: Uri): String? {
+        val displayName = resolveDisplayName(uri) ?: return null
+        val lastDotIndex = displayName.lastIndexOf('.')
+        return if (lastDotIndex > 0) displayName.substring(0, lastDotIndex) else displayName
     }
+
 }

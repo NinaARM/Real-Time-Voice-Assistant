@@ -102,7 +102,9 @@ def push_file(local_path, device_path):
 def adb_mkdir(path):
     logging.info(f"mkdir'ing and chowning {path}")
     subprocess.run(['adb', 'shell', f'mkdir -p "{path}"'], check=True)
-    subprocess.run(['adb', 'shell', f'chmod +xr "{path}"'], check=True)
+    # Ensure the app can write into this directory to avoid EACCES at runtime.
+    subprocess.run(['adb', 'shell', f'chmod 0777 "{path}"'], check=True)
+    subprocess.run(['adb', 'shell', f'chmod a+rwX "{path}"'], check=True)
 
 def sync_dir(local_dir, device_dir):
     """

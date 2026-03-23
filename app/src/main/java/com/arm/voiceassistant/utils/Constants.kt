@@ -47,6 +47,14 @@ object Constants {
     const val SME_ENABLED_THREADS_CONFIG_WARNING = "SME features available on device. " +
             "Recommended threads may differ."
 
-    const val DOWNLOAD_MANAGER_DOUBLE_CHECK_DELAY = 500L
+    const val HUGGING_FACE_CONNECTION_TIMEOUT = 10_000
     const val HUGGING_FACE_HOST = "https://huggingface.co/"
+    const val HUGGING_FACE_HEADERS_JSON =
+        """{"Accept":"application/json","Accept-Encoding":"identity","User-Agent":"curl/8.0.1"}"""
+
+
+    const val FAILED_TO_LOAD_MODELS = "Failed to load models."
+    const val FAILED_TO_LIST_MODEL_FILES = "Failed to list model files."
+
+    private const val HUGGING_FACE_PIPELINE_TAG = "image-text-to-text"
 }
