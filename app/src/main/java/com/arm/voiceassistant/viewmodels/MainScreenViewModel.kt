@@ -45,7 +45,12 @@ import com.arm.voiceassistant.utils.Constants.RESPONSE_JOB_IN_PROGRESS_ERROR
 import com.arm.voiceassistant.utils.Constants.SME_ENABLED_THREADS_CONFIG_WARNING
 import com.arm.voiceassistant.utils.Constants.VOICE_ASSISTANT_TAG
 import com.arm.voiceassistant.utils.CpuFeaturesUtility.hasSME
+import com.arm.voiceassistant.utils.DownloadUiState
+import com.arm.voiceassistant.utils.Error
 import com.arm.voiceassistant.utils.LlmBridge
+import com.arm.voiceassistant.utils.MainUiState
+import com.arm.voiceassistant.utils.ModelDetailsUiState
+import com.arm.voiceassistant.utils.ModelListUiState
 import com.arm.voiceassistant.utils.NativeResult
 import com.arm.voiceassistant.utils.Timer
 import com.arm.voiceassistant.utils.TimingStats
@@ -67,8 +72,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import okhttp3.Call
-import okhttp3.OkHttpClient
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 
@@ -95,10 +99,6 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
     val modelListUiState: StateFlow<ModelListUiState> = _modelListUiState.asStateFlow()
     private val _modelDetailsUiState = MutableStateFlow(ModelDetailsUiState())
     val modelDetailsUiState: StateFlow<ModelDetailsUiState> = _modelDetailsUiState.asStateFlow()
-    private var downloadJob: Job? = null
-    private var downloadClient: OkHttpClient? = null
-    private var downloadCall: Call? = null
-    @Volatile private var downloadCanceled = false
     val messages: SnapshotStateList<ChatMessage> = mutableStateListOf()
 
     private val filePath: String =
@@ -992,7 +992,6 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
         if (_downloadUiState.value.isRunning) {
             return
         }
-        downloadCanceled = false
         val modelKey = "${model.id}/${model.modelId}"
         updateDownloadUi {
             it.copy(
@@ -1009,117 +1008,111 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
         }
         val modelInfo = model.copy(filename = filename)
         Log.i(VOICE_ASSISTANT_TAG, "downloading... ${modelInfo.id} / ${modelInfo.modelId} / ${modelInfo.filename}")
-        val client = OkHttpClient()
-        downloadClient = client
-        downloadJob = viewModelScope.launch {
-            val logger = LoggingProgressListener { event ->
-                if (downloadCanceled) return@LoggingProgressListener
-                when (event) {
-                    is DownloadProgressEvent.Start -> {
-                        updateDownloadUi {
-                            it.copy(
-                                canStart = false,
-                                canCancel = true,
-                                isRunning = true,
-                                finishedOk = false,
-                                currentFile = event.fileName,
-                                currentModelKey = modelKey
-                            )
-                        }
-                    }
-                    is DownloadProgressEvent.Progress -> {
-                        val totalSafe =
-                            event.totalBytes?.coerceAtMost(Int.MAX_VALUE.toLong())?.toInt() ?: 0
-                        val doneSafe = event.downloadedBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-                        val progress = if (event.totalBytes != null && event.totalBytes > 0L) {
-                            ((event.downloadedBytes * 100) / event.totalBytes).toInt().coerceIn(0, 100)
-                        } else {
-                            -1
-                        }
-                        updateDownloadUi {
-                            it.copy(
-                                canStart = false,
-                                canCancel = true,
-                                isRunning = true,
-                                finishedOk = false,
-                                done = doneSafe,
-                                total = totalSafe,
-                                fileProgress = progress,
-                                currentFile = filename,
-                                currentModelKey = modelKey
-                            )
-                        }
-                    }
-                    is DownloadProgressEvent.Complete -> {
-                        updateDownloadUi {
-                            it.copy(
-                                canStart = true,
-                                canCancel = false,
-                                isRunning = false,
-                                finishedOk = true,
-                                fileProgress = 100,
-                                currentFile = null,
-                                currentModelKey = null
-                            )
-                        }
-                    }
-                    is DownloadProgressEvent.Error -> {
-                        updateDownloadUi {
-                            it.copy(
-                                canStart = true,
-                                canCancel = false,
-                                isRunning = false,
-                                finishedOk = false,
-                                currentFile = null,
-                                currentModelKey = null
-                            )
-                        }
+        val logger = LoggingProgressListener { event ->
+            when (event) {
+                is DownloadProgressEvent.Start -> {
+                    updateDownloadUi {
+                        it.copy(
+                            canStart = false,
+                            canCancel = true,
+                            isRunning = true,
+                            finishedOk = false,
+                            currentFile = event.fileName,
+                            currentModelKey = modelKey
+                        )
                     }
                 }
-            }
-            logger.onStart(filename)
-            runCatching {
-                huggingFaceApiService.downloadModelFile(
-                    context = applicationContext,
-                    client = client,
-                    modelInfo = modelInfo,
-                    downloadPath = "$filePath/$llmFramework/${modelInfo.modelId}",
-                    spec = ModelDownloadSpec(
-                        url = modelInfo.uri.toString(),
-                        fileName = filename,
-                        sha256 = null
-                    ),
-                    listener = logger,
-                    onCallCreated = { call ->
-                        downloadCall = call
+                is DownloadProgressEvent.Progress -> {
+                    val totalSafe =
+                        event.totalBytes?.coerceAtMost(Int.MAX_VALUE.toLong())?.toInt() ?: 0
+                    val doneSafe = event.downloadedBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                    val progress = if (event.totalBytes != null && event.totalBytes > 0L) {
+                        ((event.downloadedBytes * 100) / event.totalBytes).toInt().coerceIn(0, 100)
+                    } else {
+                        -1
                     }
-                )
-            }.onSuccess {
-                if (!downloadCanceled) {
-                    logger.onComplete(filename)
+                    updateDownloadUi {
+                        it.copy(
+                            canStart = false,
+                            canCancel = true,
+                            isRunning = true,
+                            finishedOk = false,
+                            done = doneSafe,
+                            total = totalSafe,
+                            fileProgress = progress,
+                            currentFile = filename,
+                            currentModelKey = modelKey
+                        )
+                    }
                 }
-            }.onFailure { e ->
-                if (!downloadCanceled) {
-                    logger.onError(filename, e)
+                is DownloadProgressEvent.Complete -> {
+                    updateDownloadUi {
+                        it.copy(
+                            canStart = true,
+                            canCancel = false,
+                            isRunning = false,
+                            finishedOk = true,
+                            fileProgress = 100,
+                            currentFile = null,
+                            currentModelKey = null
+                        )
+                    }
                 }
-            }.also {
-                downloadClient = null
-                downloadJob = null
-                downloadCall = null
+                is DownloadProgressEvent.Error -> {
+                    updateDownloadUi {
+                        it.copy(
+                            canStart = true,
+                            canCancel = false,
+                            isRunning = false,
+                            finishedOk = false,
+                            currentFile = null,
+                            currentModelKey = null
+                        )
+                    }
+                }
             }
         }
+        huggingFaceApiService.startModelDownload(
+            scope = viewModelScope,
+            context = applicationContext,
+            modelInfo = modelInfo,
+            downloadPath = "$filePath/$llmFramework/${modelInfo.modelId}",
+            spec = ModelDownloadSpec(
+                url = modelInfo.uri.toString(),
+                fileName = filename,
+                sha256 = null
+            ),
+            listener = logger
+        )
+    }
+
+    fun getExpectedModelExtensions(): List<String> {
+        val expected = runCatching {
+            val json = applicationContext.assets.open("models_query.json")
+                .bufferedReader()
+                .use { it.readText() }
+            val root = JSONObject(json)
+            root.optJSONObject(llmFramework)
+                ?.optJSONArray("expected_extension")
+        }.getOrNull()
+
+        val extensions = mutableListOf<String>()
+        if (expected != null) {
+            for (index in 0 until expected.length()) {
+                val value = expected.optString(index).trim()
+                if (value.isNotBlank()) {
+                    extensions.add(value)
+                }
+            }
+        }
+        Log.i(VOICE_ASSISTANT_TAG, "expected extensions: $extensions")
+        return extensions
     }
 
     /**
      * Load models from HuggingFace
-     *
-     * @param tag:            pipeline tag to use, default tag image-text-to-text
-     * @param maxParameters:  max number of parameters of models to show, default max of 4GB
      */
-    fun loadHuggingFaceModels(
-        tag: String = "text-generation",
-        maxParameters: Int = 2
-    ) {
+    fun loadHuggingFaceModels() {
         if (_modelListUiState.value.isLoading) {
             return
         }
@@ -1127,8 +1120,7 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
         viewModelScope.launch {
             val result = huggingFaceApiService.listModels(
                 context = applicationContext,
-                tag = tag,
-                maxParameters = maxParameters
+                framework = llmFramework
             )
             _modelListUiState.update { state ->
                 if (result.isSuccess) {
@@ -1190,26 +1182,7 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
     }
 
     fun cancelModelDownload() {
-        downloadCanceled = true
-        downloadJob?.cancel()
-        downloadJob = null
-        val call = downloadCall
-        downloadCall = null
-        val client = downloadClient
-        downloadClient = null
-        if (call != null) {
-            call.cancel()
-        }
-        if (client != null) {
-            viewModelScope.launch(Dispatchers.IO) {
-                runCatching {
-                    client.dispatcher.cancelAll()
-                    client.connectionPool.evictAll()
-                }.onFailure { error ->
-                    Log.w(VOICE_ASSISTANT_TAG, "Failed to cancel download client", error)
-                }
-            }
-        }
+        huggingFaceApiService.cancelModelDownload(viewModelScope)
         updateDownloadUi {
             it.copy(
                 canStart = true,
@@ -1220,6 +1193,46 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
                 currentModelKey = null
             )
         }
+    }
+
+    fun isModelFileDownloaded(model: HuggingFaceModel, filename: String): Boolean {
+        val modelDir = File(filePath, "$llmFramework/${model.modelId}")
+        return File(modelDir, filename).exists()
+    }
+
+    fun deleteModelFile(model: HuggingFaceModel, filename: String): Boolean {
+        val candidateDirs = listOf(
+            File(filePath, "$llmFramework/${model.modelId}"),
+            File(filePath, "$llmFramework/${model.id}/${model.modelId}")
+        )
+        var found = false
+        var ok = true
+        candidateDirs.forEach { dir ->
+            val file = File(dir, filename)
+            val partFile = File(dir, "$filename.part")
+            if (file.exists() || partFile.exists()) {
+                found = true
+            }
+            if (file.exists() && !file.delete()) {
+                ok = false
+            }
+            if (partFile.exists() && !partFile.delete()) {
+                ok = false
+            }
+            if (dir.exists() && (dir.listFiles()?.isEmpty() == true)) {
+                dir.delete()
+                dir.parentFile?.takeIf { parent ->
+                    parent.isDirectory && parent.listFiles()?.isEmpty() == true
+                }?.delete()
+            }
+        }
+        val deleted = if (found) ok else true
+        if (deleted) {
+            _modelDetailsUiState.update { state ->
+                state.copy(refreshKey = state.refreshKey + 1)
+            }
+        }
+        return deleted
     }
 
     private fun updateDownloadUi(update: (DownloadUiState) -> DownloadUiState) {
@@ -1246,7 +1259,9 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
                 try {
                     val outputStream = FileOutputStream(originalResFile)
                     inputStream?.copyTo(outputStream)
-                    Log.i(VOICE_ASSISTANT_TAG, "Imported model to directory: $destDir2")
+                    val messageText = "Imported model to directory: $destDir2"
+                    Log.i(VOICE_ASSISTANT_TAG, messageText)
+                    ToastService.showToast(messageText)
                 } catch (e : Exception) {
                     Log.e(VOICE_ASSISTANT_TAG, "Local model import failed: $e")
                 }

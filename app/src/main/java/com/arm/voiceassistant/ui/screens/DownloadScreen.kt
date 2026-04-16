@@ -42,8 +42,8 @@ import com.arm.voiceassistant.viewmodels.MainViewModel
  *
  * Displays a simple download UI currently used to test models download
  *
- * @param modifier Optional modifier for layout customization
  * @param viewModel [MainViewModel] providing chat state and actions
+ * @param modifier Optional modifier for layout customization
  */
 @Composable
 fun DownloadScreen(
@@ -152,25 +152,31 @@ fun DownloadScreen(
                         modifier = Modifier.verticalScroll(rememberScrollState())
                     ) {
                         Text(text = "Owner: ${model.id}")
-                        model.pipelineTag?.let { Text(text = "Pipeline: $it") }
-                        val filteredFiles = modelDetailsUi.files.filter {
-                            it.endsWith(".gguf", ignoreCase = true) &&
-                                it.contains("Q4", ignoreCase = true)
+                        val expectedExtensions = viewModel.getExpectedModelExtensions()
+                        val filteredFiles = if (expectedExtensions.isEmpty()) {
+                            modelDetailsUi.files
+                        } else {
+                            modelDetailsUi.files.filter { filename ->
+                                expectedExtensions.any { expected ->
+                                    filename.endsWith(expected, ignoreCase = true)
+                                }
+                            }
                         }
-                        Text(text = "Files (.gguf, Q4 only):")
+                        Text(text = "Files:")
                         when {
                             modelDetailsUi.isLoading -> Text(text = "Loading files...")
                             modelDetailsUi.error != null -> Text(
                                 text = modelDetailsUi.error ?: "Failed to load files.",
                                 color = MaterialTheme.colorScheme.error
                             )
-                            filteredFiles.isEmpty() -> Text(text = "No .gguf files found.")
+                            filteredFiles.isEmpty() -> Text(text = "No model files found.")
                             else -> {
                                 filteredFiles.forEach { filename ->
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
                                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                                     ) {
+                                        val isDownloaded = viewModel.isModelFileDownloaded(model, filename)
                                         Text(
                                             text = filename,
                                             modifier = Modifier.weight(1f),
@@ -183,13 +189,25 @@ fun DownloadScreen(
                                                 onClick = {
                                                     if (isCurrentFile) {
                                                         viewModel.cancelModelDownload()
+                                                    } else if (isDownloaded) {
+                                                        viewModel.deleteModelFile(model, filename)
                                                     } else {
                                                         viewModel.downloadModelFile(model, filename)
                                                     }
                                                 },
-                                                enabled = if (isCurrentFile) ui.canCancel else (!ui.isRunning && ui.canStart)
+                                                enabled = if (isCurrentFile) {
+                                                    ui.canCancel
+                                                } else {
+                                                    !ui.isRunning && ui.canStart
+                                                }
                                             ) {
-                                                Text(if (isCurrentFile) "Cancel" else "Download")
+                                                Text(
+                                                    when {
+                                                        isCurrentFile -> "Cancel"
+                                                        isDownloaded -> "Delete"
+                                                        else -> "Download"
+                                                    }
+                                                )
                                             }
                                             if (isCurrentFile) {
                                                 val progressText = when {
@@ -198,6 +216,13 @@ fun DownloadScreen(
                                                 }
                                                 Text(
                                                     text = progressText,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                            if (!isCurrentFile && isDownloaded) {
+                                                Text(
+                                                    text = "Saved",
                                                     style = MaterialTheme.typography.bodySmall,
                                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                                 )

@@ -15,11 +15,15 @@ import com.arm.voiceassistant.utils.Constants.HUGGING_FACE_CONNECTION_TIMEOUT
 import com.arm.voiceassistant.utils.Constants.HUGGING_FACE_HEADERS_JSON
 import com.arm.voiceassistant.utils.Constants.HUGGING_FACE_HOST
 import com.arm.voiceassistant.utils.Constants.VOICE_ASSISTANT_TAG
+import com.arm.voiceassistant.utils.ToastService
 import com.google.gson.JsonParser
 import com.google.gson.stream.JsonReader
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
 import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -31,7 +35,6 @@ import java.io.StringReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
-import kotlin.coroutines.coroutineContext
 
 /**
  * HuggingFace API service.
@@ -43,12 +46,10 @@ interface RestModelsApiService {
     /**
      * List available models with specific model tag and maximum parameters
      * @param context application context
-     * @param tag tag for models to list, i.e. image-text-to-text
-     * @param maxParameters maximum parameters of models to list, i.e. 2 -> 2B params models
+     * @param framework framework type to list models for
      */
     suspend fun listModels(context: Context,
-                           tag: String,
-                           maxParameters: Int): Result<List<HuggingFaceModel>>
+                           framework: String): Result<List<HuggingFaceModel>>
 
     /**
      * List files (siblings) for a given HuggingFace model repo.
@@ -61,7 +62,7 @@ interface RestModelsApiService {
     ): Result<List<String>>
 
     /**
-     * Download selected HuggingFace model's GGUF file via DownloadManager
+     * Download selected HuggingFace model's file via DownloadManager
      * @param context application context
      * @param client HTTP client to use for download
      * @param modelInfo hugging face model info
@@ -86,8 +87,7 @@ interface RestModelsApiService {
 data class HuggingFaceModel(
     val id: String,
     val modelId: String,
-    val filename: String,
-    val pipelineTag: String? = null
+    val filename: String
 ) {
     val uri: Uri
         get() = "$HUGGING_FACE_HOST${id}/${modelId}/resolve/main/$filename".toUri()
@@ -134,11 +134,13 @@ class LoggingProgressListener(
 
     fun onComplete(fileName: String) {
         Log.d(tag, "Model download completed: $fileName")
+        ToastService.showToast("Model download completed: $fileName")
         onEvent?.invoke(DownloadProgressEvent.Complete(fileName))
     }
 
     fun onError(fileName: String, error: Throwable) {
         Log.e(tag, "Model download failed: $fileName", error)
+        ToastService.showToast("Model download failed: $fileName. $error")
         onEvent?.invoke(DownloadProgressEvent.Error(fileName, error))
     }
 
@@ -176,26 +178,93 @@ data class ModelDownloadSpec(
  * HuggingFace Remote Data Source
  */
 class HuggingFaceApiService : RestModelsApiService {
+    private var downloadJob: Job? = null
+    private var downloadClient: OkHttpClient? = null
+    private var downloadCall: Call? = null
+    @Volatile private var downloadCanceled = false
+
+    fun startModelDownload(
+        scope: CoroutineScope,
+        context: Context,
+        modelInfo: HuggingFaceModel,
+        downloadPath: String,
+        spec: ModelDownloadSpec,
+        listener: LoggingProgressListener? = null
+    ) {
+        downloadCanceled = false
+        val client = OkHttpClient()
+        downloadClient = client
+        downloadJob = scope.launch {
+            val guardedListener = listener?.let { wrapped ->
+                object : ProgressListener {
+                    override fun onProgress(downloadedBytes: Long, totalBytes: Long?) {
+                        if (!downloadCanceled) {
+                            wrapped.onProgress(downloadedBytes, totalBytes)
+                        }
+                    }
+                }
+            }
+            listener?.onStart(spec.fileName)
+            runCatching {
+                downloadModelFile(
+                    context = context,
+                    client = client,
+                    modelInfo = modelInfo,
+                    downloadPath = downloadPath,
+                    spec = spec,
+                    listener = guardedListener,
+                    onCallCreated = { call ->
+                        downloadCall = call
+                    }
+                )
+            }.onSuccess {
+                if (!downloadCanceled) {
+                    listener?.onComplete(spec.fileName)
+                }
+            }.onFailure { e ->
+                if (!downloadCanceled) {
+                    listener?.onError(spec.fileName, e)
+                }
+            }.also {
+                downloadClient = null
+                downloadJob = null
+                downloadCall = null
+            }
+        }
+    }
+
+    fun cancelModelDownload(scope: CoroutineScope) {
+        downloadCanceled = true
+        downloadJob?.cancel()
+        downloadJob = null
+        downloadCall?.cancel()
+        downloadCall = null
+        val client = downloadClient
+        downloadClient = null
+        if (client != null) {
+            scope.launch(Dispatchers.IO) {
+                runCatching {
+                    client.dispatcher.cancelAll()
+                    client.connectionPool.evictAll()
+                }.onFailure { error ->
+                    Log.w(VOICE_ASSISTANT_TAG, "Failed to cancel download client", error)
+                }
+            }
+        }
+    }
 
     override suspend fun listModels(
         context: Context,
-        tag: String,
-        maxParameters: Int
+        framework: String,
     ): Result<List<HuggingFaceModel>> = withContext(Dispatchers.IO) {
         try {
-            val urlBuilder = Uri.parse("${HUGGING_FACE_HOST}api/models").buildUpon()
-                .appendQueryParameter("pipeline_tag", tag)
-                .appendQueryParameter("sort", "downloads")
-                .appendQueryParameter("private", "false")
-                .appendQueryParameter("apps", "llama.cpp")
-                .appendQueryParameter("direction", "-1")
-                .appendQueryParameter("limit", "20")
+            val queryParams = loadHfModelsQuery(context, framework)
 
-            if (maxParameters > 0) {
-                urlBuilder.appendQueryParameter(
-                    "num_parameters",
-                    "min:0,max:${maxParameters}B"
-                )
+            val urlBuilder = Uri.parse("${HUGGING_FACE_HOST}api/models").buildUpon()
+            val keys = queryParams.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                urlBuilder.appendQueryParameter(key, queryParams.optString(key))
             }
 
             val url = URL(urlBuilder.build().toString())
@@ -203,8 +272,8 @@ class HuggingFaceApiService : RestModelsApiService {
 
             val connection = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = 10_000
-                readTimeout = 10_000
+                connectTimeout = HUGGING_FACE_CONNECTION_TIMEOUT
+                readTimeout = HUGGING_FACE_CONNECTION_TIMEOUT
                 applyHuggingFaceHeaders(this)
             }
 
@@ -229,7 +298,6 @@ class HuggingFaceApiService : RestModelsApiService {
             val reader = JsonReader(StringReader(body)).apply { isLenient = true }
             val jsonArray = JsonParser.parseReader(reader).asJsonArray
 
-            val sizeRegex = Regex("([0-7](\\.?[0-9]*)B)", RegexOption.IGNORE_CASE)
             val models = jsonArray.mapNotNull { element ->
                 val obj = element.asJsonObject
 
@@ -240,9 +308,6 @@ class HuggingFaceApiService : RestModelsApiService {
                         obj.get("id").asString
                     else -> return@mapNotNull null
                 }
-                if (!sizeRegex.containsMatchIn(fullModelId)) {
-                    return@mapNotNull null
-                }
 
                 val parts = fullModelId.split("/", limit = 2)
                 val owner = parts.getOrElse(0) { "" }
@@ -251,26 +316,29 @@ class HuggingFaceApiService : RestModelsApiService {
                 HuggingFaceModel(
                     id = owner,
                     modelId = repo,
-                    filename = "",
-                    pipelineTag = obj.get("pipeline_tag")?.takeIf { it.isJsonPrimitive }?.asString
+                    filename = ""
                 )
             }
 
-            val modelsWithGguf = models.filter { model ->
-                val files = listModelFiles(context, model).getOrElse { emptyList() }
-                files.any { it.endsWith(".gguf", ignoreCase = true) }
-            }
 
             Log.i(
                 VOICE_ASSISTANT_TAG,
-                "HF models found: ${modelsWithGguf.size} -> ${modelsWithGguf.joinToString { "${it.id}/${it.modelId}" }}"
+                "HF models found: ${models.size} -> ${models.joinToString { "${it.id}/${it.modelId}" }}"
             )
 
-            Result.success(modelsWithGguf)
+            Result.success(models)
         } catch (e: Exception) {
             Log.e(VOICE_ASSISTANT_TAG, "Failed to list models", e)
             Result.failure(e)
         }
+    }
+
+    private fun loadHfModelsQuery(context: Context, framework: String): JSONObject {
+        val json = context.assets.open("models_query.json").bufferedReader().use { it.readText() }
+        val root = JSONObject(json)
+        return root.optJSONObject(framework)?.optJSONObject("query")
+            ?: root.optJSONObject("default")?.optJSONObject("query")
+            ?: JSONObject()
     }
 
     override suspend fun listModelFiles(
@@ -278,48 +346,135 @@ class HuggingFaceApiService : RestModelsApiService {
         modelInfo: HuggingFaceModel,
     ): Result<List<String>> = withContext(Dispatchers.IO) {
         try {
+            val rootListing = fetchModelTree(buildTreeUrl(modelInfo, null))
+            val files = rootListing.files.toMutableSet()
+
+            if (!files.any { it.contains('/') } && rootListing.directories.isNotEmpty()) {
+                val visitedDirs = mutableSetOf<String>()
+                val queue: ArrayDeque<String> = ArrayDeque(rootListing.directories)
+
+                while (queue.isNotEmpty()) {
+                    val dir = queue.removeFirst()
+                    if (!visitedDirs.add(dir)) {
+                        continue
+                    }
+                    val listing = fetchModelTree(buildTreeUrl(modelInfo, dir))
+                    files.addAll(listing.files)
+                    if (!listing.files.any { it.contains('/') } && listing.directories.isNotEmpty()) {
+                        queue.addAll(listing.directories)
+                    }
+                }
+            }
+
+            if (files.isNotEmpty()) {
+                return@withContext Result.success(files.sorted())
+            }
+
             val urlBuilder = Uri.parse("${HUGGING_FACE_HOST}api/models/${modelInfo.id}/${modelInfo.modelId}")
                 .buildUpon()
             val url = URL(urlBuilder.build().toString())
+            val filesFromSiblings = fetchModelFilesFromSiblings(url)
 
-            val connection = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = HUGGING_FACE_CONNECTION_TIMEOUT
-                readTimeout = HUGGING_FACE_CONNECTION_TIMEOUT
-                applyHuggingFaceHeaders(this)
-            }
-
-            val responseCode = connection.responseCode
-            if (!isHttpStatusOk(responseCode)) {
-                val errorBody = connection.errorStream?.bufferedReader()?.use { it.readText() }
-                return@withContext Result.failure(
-                    IllegalStateException("HuggingFace API error ($responseCode): ${errorBody?.take(200)}")
-                )
-            }
-
-            val contentType = connection.contentType ?: ""
-            val body = connection.inputStream.bufferedReader().use { it.readText() }
-            if (!contentType.contains("application/json", ignoreCase = true)) {
-                val snippet = body.take(200)
-                return@withContext Result.failure(
-                    IllegalStateException("Unexpected content type ($contentType): $snippet")
-                )
-            }
-
-            val reader = JsonReader(StringReader(body)).apply { isLenient = true }
-            val jsonObj = JsonParser.parseReader(reader).asJsonObject
-            val siblings = jsonObj.getAsJsonArray("siblings")
-            val files = siblings?.mapNotNull { element ->
-                val obj = element.asJsonObject
-                val name = obj.get("rfilename")?.asString
-                name?.takeIf { it.isNotBlank() }
-            } ?: emptyList()
-
-            Result.success(files)
+            Result.success(filesFromSiblings.sorted())
         } catch (e: Exception) {
             Log.e(VOICE_ASSISTANT_TAG, FAILED_TO_LIST_MODEL_FILES, e)
             Result.failure(e)
         }
+    }
+
+    private data class TreeListing(
+        val files: List<String>,
+        val directories: List<String>
+    )
+
+    private fun buildTreeUrl(
+        modelInfo: HuggingFaceModel,
+        path: String?
+    ): URL {
+        val base = StringBuilder()
+            .append(HUGGING_FACE_HOST)
+            .append("api/models/")
+            .append(modelInfo.id)
+            .append("/")
+            .append(modelInfo.modelId)
+            .append("/tree/main")
+        if (!path.isNullOrBlank()) {
+            base.append("/").append(path)
+        }
+        val urlBuilder = Uri.parse(base.toString()).buildUpon()
+        urlBuilder.appendQueryParameter("recursive", "1")
+        return URL(urlBuilder.build().toString())
+    }
+
+    private fun fetchModelTree(url: URL): TreeListing {
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = HUGGING_FACE_CONNECTION_TIMEOUT
+            readTimeout = HUGGING_FACE_CONNECTION_TIMEOUT
+            applyHuggingFaceHeaders(this)
+        }
+
+        val responseCode = connection.responseCode
+        if (!isHttpStatusOk(responseCode)) {
+            return TreeListing(emptyList(), emptyList())
+        }
+
+        val contentType = connection.contentType ?: ""
+        val body = connection.inputStream.bufferedReader().use { it.readText() }
+        if (!contentType.contains("application/json", ignoreCase = true)) {
+            return TreeListing(emptyList(), emptyList())
+        }
+
+        val reader = JsonReader(StringReader(body)).apply { isLenient = true }
+        val jsonArray = JsonParser.parseReader(reader).asJsonArray
+        val files = mutableListOf<String>()
+        val directories = mutableListOf<String>()
+        jsonArray.forEach { element ->
+            val obj = element.asJsonObject
+            val type = obj.get("type")?.asString
+            val path = obj.get("path")?.asString
+            if (path.isNullOrBlank()) {
+                return@forEach
+            }
+            when (type) {
+                "file" -> files.add(path)
+                "dir", "directory" -> directories.add(path)
+            }
+        }
+        return TreeListing(files, directories)
+    }
+
+    private fun fetchModelFilesFromSiblings(url: URL): List<String> {
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = HUGGING_FACE_CONNECTION_TIMEOUT
+            readTimeout = HUGGING_FACE_CONNECTION_TIMEOUT
+            applyHuggingFaceHeaders(this)
+        }
+
+        val responseCode = connection.responseCode
+        if (!isHttpStatusOk(responseCode)) {
+            val errorBody = connection.errorStream?.bufferedReader()?.use { it.readText() }
+            throw IllegalStateException(
+                "HuggingFace API error ($responseCode): ${errorBody?.take(200)}"
+            )
+        }
+
+        val contentType = connection.contentType ?: ""
+        val body = connection.inputStream.bufferedReader().use { it.readText() }
+        if (!contentType.contains("application/json", ignoreCase = true)) {
+            val snippet = body.take(200)
+            throw IllegalStateException("Unexpected content type ($contentType): $snippet")
+        }
+
+        val reader = JsonReader(StringReader(body)).apply { isLenient = true }
+        val jsonObj = JsonParser.parseReader(reader).asJsonObject
+        val siblings = jsonObj.getAsJsonArray("siblings")
+        return siblings?.mapNotNull { element ->
+            val obj = element.asJsonObject
+            val name = obj.get("rfilename")?.asString
+            name?.takeIf { it.isNotBlank() }
+        } ?: emptyList()
     }
 
     override suspend fun downloadModelFile(
@@ -387,19 +542,19 @@ class HuggingFaceApiService : RestModelsApiService {
                     if (!partFile.exists()) error("Range not satisfiable and no partial file present")
                 }
                 else -> {
-                    error("HTTP ${response.code}")
+                    ToastService.showToast("HTTP ${response.code}")
                 }
             }
         }
 
         if (!verifyIfNeeded(partFile, spec.sha256)) {
             partFile.delete()
-            error("SHA-256 mismatch for ${spec.fileName}")
+            ToastService.showToast("SHA-256 mismatch for ${spec.fileName}")
         }
 
         if (finalFile.exists()) finalFile.delete()
         if (!partFile.renameTo(finalFile)) {
-            error("Failed to promote partial download to final file")
+            ToastService.showToast("Failed to promote partial download to final file")
         }
 
         finalFile

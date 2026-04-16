@@ -4,17 +4,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package com.arm.voiceassistant.utils
+package com.arm.voiceassistant.huggingface
 
 import android.util.Log
 import androidx.test.platform.app.InstrumentationRegistry
-import com.arm.voiceassistant.huggingface.HuggingFaceApiService
-import com.arm.voiceassistant.huggingface.HuggingFaceModel
-import com.arm.voiceassistant.huggingface.ModelDownloadSpec
-import com.arm.voiceassistant.huggingface.ProgressListener
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
-import org.junit.Assert.assertTrue
+import org.junit.Assert
 import org.junit.Ignore
 import org.junit.Test
 import java.io.File
@@ -49,9 +45,11 @@ class HuggingFaceApiServiceTest {
         if (finalFile.exists()) finalFile.delete()
         if (partFile.exists()) partFile.delete()
 
-        val first = repository.downloadModelFile(context, client, modelInfo,
-            modelsDir.absolutePath, spec, progressListener)
-        assertTrue(first.exists())
-        assertTrue(first.length() > 0)
+        val first = repository.downloadModelFile(
+            context, client, modelInfo,
+            modelsDir.absolutePath, spec, progressListener
+        )
+        Assert.assertTrue(first.exists())
+        Assert.assertTrue(first.length() > 0)
     }
 }

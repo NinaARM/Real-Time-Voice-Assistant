@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package com.arm.voiceassistant.viewmodels
+package com.arm.voiceassistant.utils
 
 import com.arm.voiceassistant.huggingface.HuggingFaceModel
 import com.arm.voiceassistant.utils.Constants.ContentStates
@@ -88,12 +88,14 @@ data class ModelListUiState(
  * @property selectedModel Currently selected model for details.
  * @property files List of files in the model repo.
  * @property error Optional error message for failures.
+ * @property refreshKey used when a refresh of models details is needed on UI.
  */
 data class ModelDetailsUiState(
     val isLoading: Boolean = false,
     val selectedModel: HuggingFaceModel? = null,
     val files: List<String> = emptyList(),
-    val error: String? = null
+    val error: String? = null,
+    val refreshKey: Int = 0
 )
 
 /**

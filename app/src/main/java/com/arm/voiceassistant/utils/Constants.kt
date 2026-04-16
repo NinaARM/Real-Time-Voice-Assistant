@@ -55,6 +55,4 @@ object Constants {
 
     const val FAILED_TO_LOAD_MODELS = "Failed to load models."
     const val FAILED_TO_LIST_MODEL_FILES = "Failed to list model files."
-
-    private const val HUGGING_FACE_PIPELINE_TAG = "image-text-to-text"
 }
