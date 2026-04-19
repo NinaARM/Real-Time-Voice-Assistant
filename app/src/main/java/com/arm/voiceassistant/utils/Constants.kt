@@ -52,7 +52,4 @@ object Constants {
     const val HUGGING_FACE_HEADERS_JSON =
         """{"Accept":"application/json","Accept-Encoding":"identity","User-Agent":"curl/8.0.1"}"""
 
-
-    const val FAILED_TO_LOAD_MODELS = "Failed to load models."
-    const val FAILED_TO_LIST_MODEL_FILES = "Failed to list model files."
 }

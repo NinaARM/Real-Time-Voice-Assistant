@@ -10,7 +10,6 @@ import android.app.Application
 import android.content.Context
 import android.net.Uri
 import android.os.Environment
-import android.provider.OpenableColumns
 import android.util.Log
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.snapshots.SnapshotStateList
@@ -23,16 +22,10 @@ import com.arm.voiceassistant.data.benchmark.BenchmarkHistoryEntry
 import com.arm.voiceassistant.data.benchmark.BenchmarkHistoryRepository
 import com.arm.voiceassistant.data.benchmark.BenchmarkOverheadSummary
 import com.arm.voiceassistant.data.benchmark.isValid
-import com.arm.voiceassistant.huggingface.DownloadProgressEvent
-import com.arm.voiceassistant.huggingface.HuggingFaceModel
-import com.arm.voiceassistant.huggingface.HuggingFaceApiService
-import com.arm.voiceassistant.huggingface.LoggingProgressListener
-import com.arm.voiceassistant.huggingface.ModelDownloadSpec
 import com.arm.voiceassistant.utils.ChatMessage
 import com.arm.voiceassistant.utils.ChatMetricsUpdater
 import com.arm.voiceassistant.utils.Constants.ContentStates
 import com.arm.voiceassistant.utils.Constants.EOS
-import com.arm.voiceassistant.utils.Constants.FAILED_TO_LOAD_MODELS
 import com.arm.voiceassistant.utils.Constants.INITIAL_METRICS_VALUE
 import com.arm.voiceassistant.utils.Constants.LLM_CONTEXT_CAPACITY_ERROR
 import com.arm.voiceassistant.utils.Constants.LLM_DECODE_ERROR
@@ -49,8 +42,6 @@ import com.arm.voiceassistant.utils.DownloadUiState
 import com.arm.voiceassistant.utils.Error
 import com.arm.voiceassistant.utils.LlmBridge
 import com.arm.voiceassistant.utils.MainUiState
-import com.arm.voiceassistant.utils.ModelDetailsUiState
-import com.arm.voiceassistant.utils.ModelListUiState
 import com.arm.voiceassistant.utils.NativeResult
 import com.arm.voiceassistant.utils.Timer
 import com.arm.voiceassistant.utils.TimingStats
@@ -72,7 +63,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 
@@ -95,10 +85,6 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
     var uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
     private val _downloadUiState = MutableStateFlow(DownloadUiState())
     val downloadUiState: StateFlow<DownloadUiState> = _downloadUiState.asStateFlow()
-    private val _modelListUiState = MutableStateFlow(ModelListUiState())
-    val modelListUiState: StateFlow<ModelListUiState> = _modelListUiState.asStateFlow()
-    private val _modelDetailsUiState = MutableStateFlow(ModelDetailsUiState())
-    val modelDetailsUiState: StateFlow<ModelDetailsUiState> = _modelDetailsUiState.asStateFlow()
     val messages: SnapshotStateList<ChatMessage> = mutableStateListOf()
 
     private val filePath: String =
@@ -134,7 +120,6 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
     private val errorFlow: SharedFlow<String> = stringStatusFlow.asSharedFlow()
 
     private val applicationContext: Context = application.applicationContext
-    private val huggingFaceApiService = HuggingFaceApiService()
 
     /**
      * Initializes the [Pipeline] and related LLM helpers.
@@ -150,6 +135,7 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
         }
         runCatching {
             pipeline = Pipeline(filePath, stringStatusFlow,isTest, sharedLibraryPath)
+            pipeline.initialize()
             llm = pipeline.llm
             llmBridge = LlmBridge(llm)
             imageUploadEnabled = pipeline.supportsImageInput()
@@ -208,9 +194,12 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
      */
     init {
         reset()
-        // Keep initial pipeline creation synchronous for predictable startup behavior.
-        runBlocking {
-            initPipeline(isTest)
+        if (isTest) {
+            runBlocking { initPipeline(true) }
+        } else {
+            viewModelScope.launch {
+                initPipeline(false)
+            }
         }
     }
 
@@ -988,305 +977,42 @@ class MainViewModel(application: Application, isTest: Boolean = false) : ViewMod
         _uiState.update { it.copy(ttsWarningMessage = null) }
     }
 
-    fun downloadModelFile(model: HuggingFaceModel, filename: String) {
+    fun downloadAppModels() {
         if (_downloadUiState.value.isRunning) {
             return
         }
-        val modelKey = "${model.id}/${model.modelId}"
-        updateDownloadUi {
+        _downloadUiState.update {
             it.copy(
                 canStart = false,
-                canCancel = true,
-                isRunning = true,
-                finishedOk = false,
-                currentFile = filename,
-                currentModelKey = modelKey,
-                fileProgress = 0,
-                done = 0,
-                total = 0
-            )
-        }
-        val modelInfo = model.copy(filename = filename)
-        Log.i(VOICE_ASSISTANT_TAG, "downloading... ${modelInfo.id} / ${modelInfo.modelId} / ${modelInfo.filename}")
-        val logger = LoggingProgressListener { event ->
-            when (event) {
-                is DownloadProgressEvent.Start -> {
-                    updateDownloadUi {
-                        it.copy(
-                            canStart = false,
-                            canCancel = true,
-                            isRunning = true,
-                            finishedOk = false,
-                            currentFile = event.fileName,
-                            currentModelKey = modelKey
-                        )
-                    }
-                }
-                is DownloadProgressEvent.Progress -> {
-                    val totalSafe =
-                        event.totalBytes?.coerceAtMost(Int.MAX_VALUE.toLong())?.toInt() ?: 0
-                    val doneSafe = event.downloadedBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-                    val progress = if (event.totalBytes != null && event.totalBytes > 0L) {
-                        ((event.downloadedBytes * 100) / event.totalBytes).toInt().coerceIn(0, 100)
-                    } else {
-                        -1
-                    }
-                    updateDownloadUi {
-                        it.copy(
-                            canStart = false,
-                            canCancel = true,
-                            isRunning = true,
-                            finishedOk = false,
-                            done = doneSafe,
-                            total = totalSafe,
-                            fileProgress = progress,
-                            currentFile = filename,
-                            currentModelKey = modelKey
-                        )
-                    }
-                }
-                is DownloadProgressEvent.Complete -> {
-                    updateDownloadUi {
-                        it.copy(
-                            canStart = true,
-                            canCancel = false,
-                            isRunning = false,
-                            finishedOk = true,
-                            fileProgress = 100,
-                            currentFile = null,
-                            currentModelKey = null
-                        )
-                    }
-                }
-                is DownloadProgressEvent.Error -> {
-                    updateDownloadUi {
-                        it.copy(
-                            canStart = true,
-                            canCancel = false,
-                            isRunning = false,
-                            finishedOk = false,
-                            currentFile = null,
-                            currentModelKey = null
-                        )
-                    }
-                }
-            }
-        }
-        huggingFaceApiService.startModelDownload(
-            scope = viewModelScope,
-            context = applicationContext,
-            modelInfo = modelInfo,
-            downloadPath = "$filePath/$llmFramework/${modelInfo.modelId}",
-            spec = ModelDownloadSpec(
-                url = modelInfo.uri.toString(),
-                fileName = filename,
-                sha256 = null
-            ),
-            listener = logger
-        )
-    }
-
-    fun getExpectedModelExtensions(): List<String> {
-        val expected = runCatching {
-            val json = applicationContext.assets.open("models_query.json")
-                .bufferedReader()
-                .use { it.readText() }
-            val root = JSONObject(json)
-            root.optJSONObject(llmFramework)
-                ?.optJSONArray("expected_extension")
-        }.getOrNull()
-
-        val extensions = mutableListOf<String>()
-        if (expected != null) {
-            for (index in 0 until expected.length()) {
-                val value = expected.optString(index).trim()
-                if (value.isNotBlank()) {
-                    extensions.add(value)
-                }
-            }
-        }
-        Log.i(VOICE_ASSISTANT_TAG, "expected extensions: $extensions")
-        return extensions
-    }
-
-    /**
-     * Load models from HuggingFace
-     */
-    fun loadHuggingFaceModels() {
-        if (_modelListUiState.value.isLoading) {
-            return
-        }
-        _modelListUiState.update { it.copy(isLoading = true, error = null) }
-        viewModelScope.launch {
-            val result = huggingFaceApiService.listModels(
-                context = applicationContext,
-                framework = llmFramework
-            )
-            _modelListUiState.update { state ->
-                if (result.isSuccess) {
-                    state.copy(
-                        isLoading = false,
-                        models = result.getOrDefault(emptyList()),
-                        error = null
-                    )
-                } else {
-                    state.copy(
-                        isLoading = false,
-                        error = result.exceptionOrNull()?.message ?: FAILED_TO_LOAD_MODELS
-                    )
-                }
-            }
-        }
-    }
-
-    fun selectModelForDetails(model: HuggingFaceModel) {
-        _modelDetailsUiState.update {
-            it.copy(
-                isLoading = true,
-                selectedModel = model,
-                files = emptyList(),
-                error = null
-            )
-        }
-        viewModelScope.launch {
-            val result = huggingFaceApiService.listModelFiles(
-                context = applicationContext,
-                modelInfo = model
-            )
-            _modelDetailsUiState.update { state ->
-                if (result.isSuccess) {
-                    state.copy(
-                        isLoading = false,
-                        files = result.getOrDefault(emptyList()),
-                        error = null
-                    )
-                } else {
-                    state.copy(
-                        isLoading = false,
-                        error = result.exceptionOrNull()?.message ?: FAILED_TO_LOAD_MODELS
-                    )
-                }
-            }
-        }
-    }
-
-    fun clearSelectedModel() {
-        _modelDetailsUiState.update {
-            it.copy(
-                isLoading = false,
-                selectedModel = null,
-                files = emptyList(),
-                error = null
-            )
-        }
-    }
-
-    fun cancelModelDownload() {
-        huggingFaceApiService.cancelModelDownload(viewModelScope)
-        updateDownloadUi {
-            it.copy(
-                canStart = true,
                 canCancel = false,
-                isRunning = false,
-                finishedOk = false,
-                currentFile = null,
-                currentModelKey = null
+                isRunning = true,
+                finishedOk = false
             )
         }
-    }
-
-    fun isModelFileDownloaded(model: HuggingFaceModel, filename: String): Boolean {
-        val modelDir = File(filePath, "$llmFramework/${model.modelId}")
-        return File(modelDir, filename).exists()
-    }
-
-    fun deleteModelFile(model: HuggingFaceModel, filename: String): Boolean {
-        val candidateDirs = listOf(
-            File(filePath, "$llmFramework/${model.modelId}"),
-            File(filePath, "$llmFramework/${model.id}/${model.modelId}")
-        )
-        var found = false
-        var ok = true
-        candidateDirs.forEach { dir ->
-            val file = File(dir, filename)
-            val partFile = File(dir, "$filename.part")
-            if (file.exists() || partFile.exists()) {
-                found = true
-            }
-            if (file.exists() && !file.delete()) {
-                ok = false
-            }
-            if (partFile.exists() && !partFile.delete()) {
-                ok = false
-            }
-            if (dir.exists() && (dir.listFiles()?.isEmpty() == true)) {
-                dir.delete()
-                dir.parentFile?.takeIf { parent ->
-                    parent.isDirectory && parent.listFiles()?.isEmpty() == true
-                }?.delete()
-            }
-        }
-        val deleted = if (found) ok else true
-        if (deleted) {
-            _modelDetailsUiState.update { state ->
-                state.copy(refreshKey = state.refreshKey + 1)
-            }
-        }
-        return deleted
-    }
-
-    private fun updateDownloadUi(update: (DownloadUiState) -> DownloadUiState) {
-        _downloadUiState.update(update)
-    }
-
-    /**
-     * Imports a model file selected by the user into the app's LLM models folder.
-     * @param uri The [Uri] of the model selected by the user.
-     */
-    fun importModel(uri: Uri) {
-        Log.i(VOICE_ASSISTANT_TAG, "importing model: ${uri.path}")
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                val inputStream = contentResolver.openInputStream(uri)
-                val filename = resolveDisplayName(uri)
-                val destDir = File(filePath, llmFramework)
-                val destDir2 = File(destDir, resolveDisplayNameWithoutExtension(uri))
-                if (!destDir2.mkdirs()) {
-                    Log.i(VOICE_ASSISTANT_TAG, "Failed to create destination directory: $destDir2")
+            var finishedOk = false
+            try {
+                val result = pipeline.downloadManifestModels()
+                if (result.isSuccess) {
+                    reinitializePipelineForChat()
+                    finishedOk = true
+                } else {
+                    Log.e(
+                        VOICE_ASSISTANT_TAG,
+                        "Failed to download app models",
+                        result.exceptionOrNull()
+                    )
                 }
-
-                val originalResFile = File(destDir2, filename)
-                try {
-                    val outputStream = FileOutputStream(originalResFile)
-                    inputStream?.copyTo(outputStream)
-                    val messageText = "Imported model to directory: $destDir2"
-                    Log.i(VOICE_ASSISTANT_TAG, messageText)
-                    ToastService.showToast(messageText)
-                } catch (e : Exception) {
-                    Log.e(VOICE_ASSISTANT_TAG, "Local model import failed: $e")
+            } finally {
+                _downloadUiState.update {
+                    it.copy(
+                        canStart = true,
+                        canCancel = false,
+                        isRunning = false,
+                        finishedOk = finishedOk
+                    )
                 }
             }
         }
     }
-
-    private fun resolveDisplayName(uri: Uri): String? {
-        fun withLocalPrefix(name: String): String {
-            return if (name.startsWith("local_")) name else "local_$name"
-        }
-
-        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (nameIndex != -1 && cursor.moveToFirst()) {
-               return withLocalPrefix(cursor.getString(nameIndex))
-            }
-        }
-        return uri.lastPathSegment?.let(::withLocalPrefix)
-    }
-
-    private fun resolveDisplayNameWithoutExtension(uri: Uri): String? {
-        val displayName = resolveDisplayName(uri) ?: return null
-        val lastDotIndex = displayName.lastIndexOf('.')
-        return if (lastDotIndex > 0) displayName.substring(0, lastDotIndex) else displayName
-    }
-
 }

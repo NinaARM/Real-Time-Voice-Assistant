@@ -6,27 +6,42 @@
 
 package com.arm.voiceassistant.huggingface
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.util.Log
 import androidx.test.platform.app.InstrumentationRegistry
+import com.arm.voiceassistant.utils.Constants.VOICE_ASSISTANT_TAG
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import org.junit.Assert
-import org.junit.Ignore
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
 
 class HuggingFaceApiServiceTest {
 
+
     @Test
-    @Ignore
     fun downloadModelFileTest() = runBlocking {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val connectivityManager =
+            context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val networkCapabilities = connectivityManager.getNetworkCapabilities(
+            connectivityManager.activeNetwork
+        )
+        assumeTrue(
+            "Device has no validated internet connection",
+            networkCapabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true &&
+                networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        )
         val client = OkHttpClient()
 
         val repository = HuggingFaceApiService()
         val spec = ModelDownloadSpec(
             url = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/mmproj-F16.gguf",
             fileName = "mmproj-F16.gguf",
+            destination = "Qwen3.5-4B-GGUF/mmproj-F16.gguf",
             sha256 = "cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864"
         )
         val modelInfo = HuggingFaceModel(
@@ -36,7 +51,7 @@ class HuggingFaceApiServiceTest {
         )
         val progressListener = object : ProgressListener {
             override fun onProgress(downloadedBytes: Long, totalBytes: Long?) {
-                Log.i("tag", "downloaded $downloadedBytes / ${totalBytes ?: -1}")
+                Log.d(VOICE_ASSISTANT_TAG, "downloaded $downloadedBytes / ${totalBytes ?: -1}")
             }
         }
         val modelsDir = File(context.filesDir, "models")
@@ -49,7 +64,7 @@ class HuggingFaceApiServiceTest {
             context, client, modelInfo,
             modelsDir.absolutePath, spec, progressListener
         )
-        Assert.assertTrue(first.exists())
-        Assert.assertTrue(first.length() > 0)
+        Assert.assertTrue(first.isSuccess)
+        Assert.assertTrue(first.getOrNull()?.exists() ?: false)
     }
 }

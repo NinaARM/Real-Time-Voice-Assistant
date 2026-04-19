@@ -10,7 +10,6 @@ import android.content.Context
 import android.net.Uri
 import android.util.Log
 import androidx.core.net.toUri
-import com.arm.voiceassistant.utils.Constants.FAILED_TO_LIST_MODEL_FILES
 import com.arm.voiceassistant.utils.Constants.HUGGING_FACE_CONNECTION_TIMEOUT
 import com.arm.voiceassistant.utils.Constants.HUGGING_FACE_HEADERS_JSON
 import com.arm.voiceassistant.utils.Constants.HUGGING_FACE_HOST
@@ -18,6 +17,7 @@ import com.arm.voiceassistant.utils.Constants.VOICE_ASSISTANT_TAG
 import com.arm.voiceassistant.utils.ToastService
 import com.google.gson.JsonParser
 import com.google.gson.stream.JsonReader
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -52,16 +52,6 @@ interface RestModelsApiService {
                            framework: String): Result<List<HuggingFaceModel>>
 
     /**
-     * List files (siblings) for a given HuggingFace model repo.
-     * @param context application context
-     * @param modelInfo model info to list available files for
-     */
-    suspend fun listModelFiles(
-        context: Context,
-        modelInfo: HuggingFaceModel,
-    ): Result<List<String>>
-
-    /**
      * Download selected HuggingFace model's file via DownloadManager
      * @param context application context
      * @param client HTTP client to use for download
@@ -78,7 +68,7 @@ interface RestModelsApiService {
         spec: ModelDownloadSpec,
         listener: ProgressListener? = null,
         onCallCreated: ((Call) -> Unit)? = null
-    ): File
+    ): Result<File>
 }
 
 /**
@@ -170,6 +160,7 @@ class LoggingProgressListener(
 data class ModelDownloadSpec(
     val url: String,
     val fileName: String,
+    val destination: String,
     val sha256: String? = null,
     val bearerToken: String? = null
 )
@@ -178,10 +169,22 @@ data class ModelDownloadSpec(
  * HuggingFace Remote Data Source
  */
 class HuggingFaceApiService : RestModelsApiService {
+    private data class VerificationKey(
+        val path: String,
+        val length: Long,
+        val lastModified: Long,
+        val expectedSha256: String?
+    )
+
+    companion object {
+        private val verifiedFiles = mutableSetOf<VerificationKey>()
+    }
+
     private var downloadJob: Job? = null
     private var downloadClient: OkHttpClient? = null
     private var downloadCall: Call? = null
-    @Volatile private var downloadCanceled = false
+    @Volatile
+    private var downloadCanceled = false
 
     fun startModelDownload(
         scope: CoroutineScope,
@@ -205,19 +208,18 @@ class HuggingFaceApiService : RestModelsApiService {
                 }
             }
             listener?.onStart(spec.fileName)
-            runCatching {
-                downloadModelFile(
-                    context = context,
-                    client = client,
-                    modelInfo = modelInfo,
-                    downloadPath = downloadPath,
-                    spec = spec,
-                    listener = guardedListener,
-                    onCallCreated = { call ->
-                        downloadCall = call
-                    }
-                )
-            }.onSuccess {
+            val result = downloadModelFile(
+                context = context,
+                client = client,
+                modelInfo = modelInfo,
+                downloadPath = downloadPath,
+                spec = spec,
+                listener = guardedListener,
+                onCallCreated = { call ->
+                    downloadCall = call
+                }
+            )
+            result.onSuccess {
                 if (!downloadCanceled) {
                     listener?.onComplete(spec.fileName)
                 }
@@ -304,8 +306,10 @@ class HuggingFaceApiService : RestModelsApiService {
                 val fullModelId = when {
                     obj.has("modelId") && !obj.get("modelId").isJsonNull ->
                         obj.get("modelId").asString
+
                     obj.has("id") && !obj.get("id").isJsonNull ->
                         obj.get("id").asString
+
                     else -> return@mapNotNull null
                 }
 
@@ -341,142 +345,6 @@ class HuggingFaceApiService : RestModelsApiService {
             ?: JSONObject()
     }
 
-    override suspend fun listModelFiles(
-        context: Context,
-        modelInfo: HuggingFaceModel,
-    ): Result<List<String>> = withContext(Dispatchers.IO) {
-        try {
-            val rootListing = fetchModelTree(buildTreeUrl(modelInfo, null))
-            val files = rootListing.files.toMutableSet()
-
-            if (!files.any { it.contains('/') } && rootListing.directories.isNotEmpty()) {
-                val visitedDirs = mutableSetOf<String>()
-                val queue: ArrayDeque<String> = ArrayDeque(rootListing.directories)
-
-                while (queue.isNotEmpty()) {
-                    val dir = queue.removeFirst()
-                    if (!visitedDirs.add(dir)) {
-                        continue
-                    }
-                    val listing = fetchModelTree(buildTreeUrl(modelInfo, dir))
-                    files.addAll(listing.files)
-                    if (!listing.files.any { it.contains('/') } && listing.directories.isNotEmpty()) {
-                        queue.addAll(listing.directories)
-                    }
-                }
-            }
-
-            if (files.isNotEmpty()) {
-                return@withContext Result.success(files.sorted())
-            }
-
-            val urlBuilder = Uri.parse("${HUGGING_FACE_HOST}api/models/${modelInfo.id}/${modelInfo.modelId}")
-                .buildUpon()
-            val url = URL(urlBuilder.build().toString())
-            val filesFromSiblings = fetchModelFilesFromSiblings(url)
-
-            Result.success(filesFromSiblings.sorted())
-        } catch (e: Exception) {
-            Log.e(VOICE_ASSISTANT_TAG, FAILED_TO_LIST_MODEL_FILES, e)
-            Result.failure(e)
-        }
-    }
-
-    private data class TreeListing(
-        val files: List<String>,
-        val directories: List<String>
-    )
-
-    private fun buildTreeUrl(
-        modelInfo: HuggingFaceModel,
-        path: String?
-    ): URL {
-        val base = StringBuilder()
-            .append(HUGGING_FACE_HOST)
-            .append("api/models/")
-            .append(modelInfo.id)
-            .append("/")
-            .append(modelInfo.modelId)
-            .append("/tree/main")
-        if (!path.isNullOrBlank()) {
-            base.append("/").append(path)
-        }
-        val urlBuilder = Uri.parse(base.toString()).buildUpon()
-        urlBuilder.appendQueryParameter("recursive", "1")
-        return URL(urlBuilder.build().toString())
-    }
-
-    private fun fetchModelTree(url: URL): TreeListing {
-        val connection = (url.openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = HUGGING_FACE_CONNECTION_TIMEOUT
-            readTimeout = HUGGING_FACE_CONNECTION_TIMEOUT
-            applyHuggingFaceHeaders(this)
-        }
-
-        val responseCode = connection.responseCode
-        if (!isHttpStatusOk(responseCode)) {
-            return TreeListing(emptyList(), emptyList())
-        }
-
-        val contentType = connection.contentType ?: ""
-        val body = connection.inputStream.bufferedReader().use { it.readText() }
-        if (!contentType.contains("application/json", ignoreCase = true)) {
-            return TreeListing(emptyList(), emptyList())
-        }
-
-        val reader = JsonReader(StringReader(body)).apply { isLenient = true }
-        val jsonArray = JsonParser.parseReader(reader).asJsonArray
-        val files = mutableListOf<String>()
-        val directories = mutableListOf<String>()
-        jsonArray.forEach { element ->
-            val obj = element.asJsonObject
-            val type = obj.get("type")?.asString
-            val path = obj.get("path")?.asString
-            if (path.isNullOrBlank()) {
-                return@forEach
-            }
-            when (type) {
-                "file" -> files.add(path)
-                "dir", "directory" -> directories.add(path)
-            }
-        }
-        return TreeListing(files, directories)
-    }
-
-    private fun fetchModelFilesFromSiblings(url: URL): List<String> {
-        val connection = (url.openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = HUGGING_FACE_CONNECTION_TIMEOUT
-            readTimeout = HUGGING_FACE_CONNECTION_TIMEOUT
-            applyHuggingFaceHeaders(this)
-        }
-
-        val responseCode = connection.responseCode
-        if (!isHttpStatusOk(responseCode)) {
-            val errorBody = connection.errorStream?.bufferedReader()?.use { it.readText() }
-            throw IllegalStateException(
-                "HuggingFace API error ($responseCode): ${errorBody?.take(200)}"
-            )
-        }
-
-        val contentType = connection.contentType ?: ""
-        val body = connection.inputStream.bufferedReader().use { it.readText() }
-        if (!contentType.contains("application/json", ignoreCase = true)) {
-            val snippet = body.take(200)
-            throw IllegalStateException("Unexpected content type ($contentType): $snippet")
-        }
-
-        val reader = JsonReader(StringReader(body)).apply { isLenient = true }
-        val jsonObj = JsonParser.parseReader(reader).asJsonObject
-        val siblings = jsonObj.getAsJsonArray("siblings")
-        return siblings?.mapNotNull { element ->
-            val obj = element.asJsonObject
-            val name = obj.get("rfilename")?.asString
-            name?.takeIf { it.isNotBlank() }
-        } ?: emptyList()
-    }
-
     override suspend fun downloadModelFile(
         context: Context,
         client: OkHttpClient,
@@ -485,83 +353,137 @@ class HuggingFaceApiService : RestModelsApiService {
         spec: ModelDownloadSpec,
         listener: ProgressListener?,
         onCallCreated: ((Call) -> Unit)?
-    ): File = withContext(Dispatchers.IO) {
-        require(spec.fileName.isNotBlank()) { "Model filename is required" }
-        require(spec.url.isNotBlank()) { "Model download URL is required" }
-
-        val dir = File(downloadPath).apply { mkdirs() }
-        val finalFile = File(dir, spec.fileName)
-        val partFile = File(dir, "${spec.fileName}.part")
-
-        if (finalFile.exists() && verifyIfNeeded(finalFile, spec.sha256)) {
-            return@withContext finalFile
+    ): Result<File> = withContext(Dispatchers.IO) {
+        if (spec.fileName.isBlank()) {
+            return@withContext downloadFailure("Model filename is required")
+        }
+        if (spec.url.isBlank()) {
+            return@withContext downloadFailure("Model download URL is required")
         }
 
-        var downloaded = if (partFile.exists()) partFile.length() else 0L
+        try {
+            val dir = File(downloadPath).apply { mkdirs() }
+            val finalFile = resolveDownloadTarget(dir, spec)
+            val partFile = File(finalFile.parentFile ?: dir, "${finalFile.name}.part")
+            finalFile.parentFile?.mkdirs()
 
-        val requestBuilder = Request.Builder()
-            .url(spec.url)
+            if (finalFile.exists() && verifyIfNeeded(finalFile, spec.sha256)) {
+                return@withContext Result.success(finalFile)
+            }
 
-        if (downloaded > 0L) {
-            requestBuilder.header("Range", "bytes=$downloaded-")
-        }
-        spec.bearerToken?.let {
-            requestBuilder.header("Authorization", "Bearer $it")
-        }
-
-        val call = client.newCall(requestBuilder.build())
-        onCallCreated?.invoke(call)
-        call.execute().use { response ->
-            when (response.code) {
-                206, 200 -> {
-                    if (response.code == 200 && downloaded > 0L) {
-                        partFile.delete()
-                        downloaded = 0L
-                    }
-
-                    val body = response.body ?: error("Empty response body")
-                    val total = computeTotalBytes(response, downloaded)
-
-                    partFile.parentFile?.mkdirs()
-                    FileOutputStream(partFile, downloaded > 0L && response.code == 206).use { out ->
-                        val input = body.byteStream()
-                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                        var read: Int
-                        var current = downloaded
-
-                        while (input.read(buffer).also { read = it } != -1) {
-                            coroutineContext.ensureActive()
-                            out.write(buffer, 0, read)
-                            current += read
-                            listener?.onProgress(current, total)
-                        }
-                        out.fd.sync()
-                    }
+            val legacyFile = File(dir, spec.fileName)
+            if (legacyFile.exists() && verifyIfNeeded(legacyFile, spec.sha256)) {
+                if (finalFile.exists() && !finalFile.delete()) {
+                    return@withContext downloadFailure(
+                        "Failed to replace existing model file: ${finalFile.absolutePath}"
+                    )
                 }
-                416 -> {
-                    if (!partFile.exists()) error("Range not satisfiable and no partial file present")
+                if (!legacyFile.renameTo(finalFile)) {
+                    return@withContext downloadFailure(
+                        "Failed to move legacy model file to ${finalFile.absolutePath}"
+                    )
                 }
-                else -> {
-                    ToastService.showToast("HTTP ${response.code}")
+                markVerified(finalFile, spec.sha256)
+                return@withContext Result.success(finalFile)
+            }
+
+            if (!partFile.exists()) {
+                val legacyPartFile = File(dir, "${spec.fileName}.part")
+                if (legacyPartFile.exists()) {
+                    legacyPartFile.renameTo(partFile)
                 }
             }
-        }
 
-        if (!verifyIfNeeded(partFile, spec.sha256)) {
-            partFile.delete()
-            ToastService.showToast("SHA-256 mismatch for ${spec.fileName}")
-        }
+            var downloaded = if (partFile.exists()) partFile.length() else 0L
 
-        if (finalFile.exists()) finalFile.delete()
-        if (!partFile.renameTo(finalFile)) {
-            ToastService.showToast("Failed to promote partial download to final file")
-        }
+            val requestBuilder = Request.Builder()
+                .url(spec.url)
 
-        finalFile
+            if (downloaded > 0L) {
+                requestBuilder.header("Range", "bytes=$downloaded-")
+            }
+            spec.bearerToken?.let {
+                requestBuilder.header("Authorization", "Bearer $it")
+            }
+
+            val call = client.newCall(requestBuilder.build())
+            onCallCreated?.invoke(call)
+            call.execute().use { response ->
+                when (response.code) {
+                    206, 200 -> {
+                        if (response.code == 200 && downloaded > 0L) {
+                            partFile.delete()
+                            downloaded = 0L
+                        }
+
+                        val body = response.body
+                            ?: return@withContext downloadFailure("Empty response body")
+                        val total = computeTotalBytes(response, downloaded)
+
+                        partFile.parentFile?.mkdirs()
+                        FileOutputStream(partFile, downloaded > 0L && response.code == 206).use { out ->
+                            val input = body.byteStream()
+                            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                            var read: Int
+                            var current = downloaded
+
+                            while (input.read(buffer).also { read = it } != -1) {
+                                coroutineContext.ensureActive()
+                                out.write(buffer, 0, read)
+                                current += read
+                                listener?.onProgress(current, total)
+                            }
+                            out.fd.sync()
+                        }
+                    }
+
+                    416 -> {
+                        if (!partFile.exists()) {
+                            return@withContext downloadFailure(
+                                "Range not satisfiable and no partial file present"
+                            )
+                        }
+                    }
+
+                    else -> {
+                        return@withContext downloadFailure(
+                            "HTTP ${response.code} while downloading ${spec.fileName}"
+                        )
+                    }
+                }
+            }
+
+            if (!verifyIfNeeded(partFile, spec.sha256)) {
+                partFile.delete()
+                return@withContext downloadFailure("SHA-256 mismatch for ${spec.fileName}")
+            }
+
+            if (finalFile.exists() && !finalFile.delete()) {
+                return@withContext downloadFailure(
+                    "Failed to replace existing model file: ${finalFile.absolutePath}"
+                )
+            }
+            if (!partFile.renameTo(finalFile)) {
+                return@withContext downloadFailure(
+                    "Failed to promote partial download to ${finalFile.absolutePath}"
+                )
+            }
+            markVerified(finalFile, spec.sha256)
+
+            Result.success(finalFile)
+        } catch (error: CancellationException) {
+            Log.e(VOICE_ASSISTANT_TAG, "Download cancelled for ${spec.fileName}", error)
+            Result.failure(error)
+        } catch (exception: Exception) {
+            Log.e(VOICE_ASSISTANT_TAG, "Failed to download ${spec.fileName}", exception)
+            Result.failure(exception)
+        }
     }
 
-    private fun isHttpStatusOk(status: Int): Boolean {
-        return (status in 200..399)
+    private fun downloadFailure(message: String): Result<File> {
+        val exception = IllegalStateException(message)
+        Log.e(VOICE_ASSISTANT_TAG, message, exception)
+        return Result.failure(exception)
     }
 
     private fun computeTotalBytes(response: Response, alreadyDownloaded: Long): Long? {
@@ -574,9 +496,43 @@ class HuggingFaceApiService : RestModelsApiService {
         return if (response.code == 206) alreadyDownloaded + cl else cl
     }
 
-    private fun verifyIfNeeded(file: File, expectedSha256: String?): Boolean {
-        if (expectedSha256 == null) return file.exists() && file.length() > 0
-        return sha256(file).equals(expectedSha256, ignoreCase = true)
+    internal fun verifyIfNeeded(file: File, expectedSha256: String?): Boolean {
+        if (!file.exists() || file.length() <= 0L) return false
+        val key = verificationKey(file, expectedSha256)
+        synchronized(verifiedFiles) {
+            if (key in verifiedFiles) return true
+        }
+
+        val isValid = expectedSha256 == null || sha256(file).equals(expectedSha256, ignoreCase = true)
+        if (isValid) markVerified(file, expectedSha256)
+        return isValid
+    }
+
+    private fun markVerified(file: File, expectedSha256: String?) {
+        val key = verificationKey(file, expectedSha256)
+        synchronized(verifiedFiles) {
+            verifiedFiles.removeAll { it.path == key.path }
+            verifiedFiles.add(key)
+        }
+    }
+
+    private fun verificationKey(file: File, expectedSha256: String?) = VerificationKey(
+        path = file.absolutePath,
+        length = file.length(),
+        lastModified = file.lastModified(),
+        expectedSha256 = expectedSha256?.lowercase()
+    )
+
+    private fun resolveDownloadTarget(downloadRoot: File, spec: ModelDownloadSpec): File {
+        val destination = spec.destination.trim().trimStart('/', '\\')
+        if (destination.isBlank()) {
+            return File(downloadRoot, spec.fileName)
+        }
+        return if (destination.endsWith("/") || destination.endsWith(File.separator)) {
+            File(File(downloadRoot, destination), spec.fileName)
+        } else {
+            File(downloadRoot, destination)
+        }
     }
 
     private fun sha256(file: File): String {

@@ -137,7 +137,7 @@ class UtilsTest {
 
         file.writeText(setupConfigJson().toString())
         Log.i("tag", file.toString())
-        val cfg = readLlmUserConfig(file, modelPath)
+        val cfg = readLlmUserConfig(file.readText(), modelPath)
 
         val gson = Gson()
         val llmConfig = gson.fromJson(cfg.toString(), Utils.UserLlmConfig::class.java)
@@ -156,7 +156,7 @@ class UtilsTest {
         val file = File.createTempFile("user-config", ".json").apply { deleteOnExit() }
 
         file.writeText(jsonConfig.toString())
-        val cfg = readLlmUserConfig(file, modelPath)
+        val cfg = readLlmUserConfig(file.readText(), modelPath)
 
         val gson = Gson()
         val llmConfig = gson.fromJson(cfg.toString(), Utils.UserLlmConfig::class.java)
@@ -173,7 +173,7 @@ class UtilsTest {
         val file = File.createTempFile("user-config", ".json").apply { deleteOnExit() }
         file.writeText(configJson.toString())
 
-        val cfg = readLlmUserConfig(file, modelPath)
+        val cfg = readLlmUserConfig(file.readText(), modelPath)
 
         val gson = Gson()
         val llmConfig = gson.fromJson(cfg.toString(), Utils.UserLlmConfig::class.java)
@@ -191,7 +191,7 @@ class UtilsTest {
         val file = File.createTempFile("user-config", ".json").apply { deleteOnExit() }
         file.writeText(jsonMissingNumThreads.toString())
 
-        assertFalse(isValidLlmConfig(file))
+        assertFalse(isValidLlmConfig(file.readText()))
     }
 
     @Test
@@ -202,7 +202,7 @@ class UtilsTest {
         val file = File.createTempFile("user-config", ".json").apply { deleteOnExit() }
         file.writeText(configJson.toString())
 
-        assertFalse(isValidLlmConfig(file))
+        assertFalse(isValidLlmConfig(file.readText()))
     }
 
     @Test
@@ -210,6 +210,6 @@ class UtilsTest {
         val notValidJson = "{ not: valid json }"
         val file = File.createTempFile("user-config", ".json").apply { deleteOnExit() }
         file.writeText(notValidJson)
-        assertFalse(isValidLlmConfig(file))
+        assertFalse(isValidLlmConfig(file.readText()))
     }
 }

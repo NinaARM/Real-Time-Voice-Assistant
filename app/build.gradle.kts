@@ -7,6 +7,7 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 project.ext.set("STT_MODELS_DIR", "$projectDir/../stt/stt-src/resources_downloaded/models/")
@@ -17,7 +18,7 @@ project.ext.set("CONFIG_DIR_STT", "$projectDir/../stt/stt-src/model_configuratio
 project.ext.set("DEVICE_FOLDER", "/storage/emulated/0/Android/data/com.arm.voiceassistant/files/Download/")
 project.ext.set("PUSH_MODELS_PY", "$projectDir/pushAppResources.py")
 
-apply("download.gradle")
+apply("update-assets.gradle")
 
 android {
     namespace = "com.arm.voiceassistant"
@@ -148,6 +149,7 @@ dependencies {
     implementation(libs.bundles.retrofit)
     implementation(libs.google.accompanist.permissions)
     implementation(libs.google.gson)
+    implementation(libs.kotlinx.serialization.json)
     implementation(libs.glide.compose)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
